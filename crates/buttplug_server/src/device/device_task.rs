@@ -14,7 +14,7 @@
 
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 
-use buttplug_core::util::async_manager;
+use buttplug_core::{errors::ButtplugDeviceError, util::async_manager};
 use futures::future;
 use tokio::{
   select,
@@ -29,9 +29,8 @@ use super::{
 
 /// Bounded wait for a write-acknowledged command to reach hardware.
 ///
-/// Stop commands (and therefore shutdown) resolve Ok after this elapses even if
-/// the device io task never reports the write, so a wedged or dead device cannot
-/// hang shutdown.
+/// A wedged or dead device cannot hang shutdown. Elapsing this deadline is a
+/// failure to confirm the Stop write, not a successful hardware receipt.
 pub(crate) const WRITE_ACK_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// A unit of work handed to the device io task.
@@ -45,7 +44,7 @@ pub struct DeviceTaskMessage {
   pub commands: Vec<HardwareCommand>,
   /// When set, the io task flushes immediately and signals once the write has
   /// reached hardware.
-  pub write_ack: Option<oneshot::Sender<()>>,
+  pub write_ack: Option<oneshot::Sender<Result<(), ButtplugDeviceError>>>,
 }
 
 impl DeviceTaskMessage {
@@ -59,7 +58,9 @@ impl DeviceTaskMessage {
 
   /// Build a write-acknowledged message and return the receiver its caller
   /// awaits to know the write reached hardware.
-  pub fn acknowledged(commands: Vec<HardwareCommand>) -> (Self, oneshot::Receiver<()>) {
+  pub fn acknowledged(
+    commands: Vec<HardwareCommand>,
+  ) -> (Self, oneshot::Receiver<Result<(), ButtplugDeviceError>>) {
     let (tx, rx) = oneshot::channel();
     (
       Self {
@@ -102,15 +103,25 @@ async fn flush_pending(
   hardware: &Hardware,
   pending: &mut VecDeque<HardwareCommand>,
   track_keepalive: bool,
-) -> Option<HardwareWriteCmd> {
+) -> (Option<HardwareWriteCmd>, Result<(), ButtplugDeviceError>) {
   let mut last_write: Option<HardwareWriteCmd> = None;
+  let mut result = Ok(());
   while let Some(cmd) = pending.pop_front() {
-    let _ = hardware.parse_message(&cmd).await;
-    if track_keepalive && let HardwareCommand::Write(ref write_cmd) = cmd {
-      last_write = Some(write_cmd.clone());
+    match hardware.parse_message(&cmd).await {
+      Ok(()) => {
+        if track_keepalive && let HardwareCommand::Write(ref write_cmd) = cmd {
+          last_write = Some(write_cmd.clone());
+        }
+      }
+      Err(error) => {
+        // Still attempt every independent stop in the batch.
+        if result.is_ok() {
+          result = Err(error);
+        }
+      }
     }
   }
-  last_write
+  (last_write, result)
 }
 
 async fn run_device_task(
@@ -195,15 +206,14 @@ async fn run_device_task(
             pending_commands.retain(|existing| !command.overlaps(existing));
             pending_commands.push_back(command);
           }
-          if let Some(write) =
-            flush_pending(&hardware, &mut pending_commands, track_keepalive).await
-          {
-            keepalive_packet = Some(write);
-          }
+          // Never replay a pre-Stop motion packet, including if the Stop write
+          // fails. A successful stop batch can supply the new keepalive packet.
+          let (last_write, result) = flush_pending(&hardware, &mut pending_commands, track_keepalive).await;
+          keepalive_packet = last_write;
           batch_deadline = None;
           // Acknowledgement is best-effort: a dropped receiver means the caller
           // no longer cares (e.g. they raced ahead to disconnect).
-          let _ = ack.send(());
+          let _ = ack.send(result);
         } else if let Some(device_wait_duration) = device_wait_duration {
           // Batching enabled
           if pending_commands.is_empty() {
@@ -229,7 +239,7 @@ async fn run_device_task(
             }
           }
           if let Some(ack) = write_ack {
-            let _ = ack.send(());
+            let _ = ack.send(Ok(()));
           }
         }
       }
@@ -237,7 +247,7 @@ async fn run_device_task(
       // Priority 2: Batch deadline reached - flush pending commands
       _ = batch_fut => {
         trace!("Batch deadline reached, sending {} commands", pending_commands.len());
-        if let Some(write) =
+        if let (Some(write), _) =
           flush_pending(&hardware, &mut pending_commands, track_keepalive).await
         {
           keepalive_packet = Some(write);

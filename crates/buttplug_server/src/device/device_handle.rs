@@ -378,6 +378,25 @@ impl DeviceHandle {
     // the disconnect would routinely beat the batched write and drop it.
     let mut hardware_commands: Vec<HardwareCommand> = Vec::new();
     if msg.outputs() {
+      for (index, feature) in self.definition.features() {
+        if msg
+          .feature_index()
+          .is_none_or(|requested| requested == *index)
+          && feature.output.iter().any(|output| {
+            matches!(
+              output,
+              ServerDeviceFeatureOutput::Position(_)
+                | ServerDeviceFeatureOutput::HwPositionWithDuration(_)
+            )
+          })
+        {
+          match self.handler.handle_position_stop_cmd(*index, feature.id()) {
+            Ok(commands) => hardware_commands.extend(commands),
+            Err(error) => return error.into(),
+          }
+          self.last_output_command.remove(&feature.id());
+        }
+      }
       for stop_msg in self.stop_commands.iter() {
         if let ButtplugDeviceCommandMessageUnionV4::OutputCmd(checked) = stop_msg
           && msg
@@ -433,25 +452,22 @@ impl DeviceHandle {
       }
 
       let (message, ack) = DeviceTaskMessage::acknowledged(hardware_commands);
-      if sender.send(message).await.is_err() {
-        // The device io task is gone (already disconnected). There is nothing to
-        // flush, so the stop is satisfied.
-        return Ok(message::OkV0::default().into());
-      }
+      let write = async move {
+        sender.send(message).await.map_err(|_| ButtplugDeviceError::DeviceCommunicationError(
+          "Device task closed before Stop could be written".to_owned()))?;
+        ack.await.unwrap_or_else(|_| Err(ButtplugDeviceError::DeviceCommunicationError(
+          "Device task closed before confirming the Stop write".to_owned())))
+      };
 
-      // Bound the wait so a wedged or dead device cannot hang shutdown: a
-      // successful ack means the stop write reached hardware; an elapsed timeout
-      // still resolves Ok.
-      match select! {
+      // Bound shutdown without claiming an unwritten Stop succeeded. A transport
+      // write receipt is still not physical position or motor-state telemetry.
+      let result = select! {
         biased;
-        result = ack => result,
-        _ = async_manager::sleep(WRITE_ACK_TIMEOUT) => Ok(()),
-      } {
-        Ok(()) => Ok(message::OkV0::default().into()),
-        // Receiver dropped without sending: the io task exited mid-flush. The
-        // stop may not have landed, but shutdown must not hang on it.
-        Err(_) => Ok(message::OkV0::default().into()),
-      }
+        result = write => result,
+        _ = async_manager::sleep(WRITE_ACK_TIMEOUT) => Err(ButtplugDeviceError::DeviceCommunicationError(
+          "Timed out waiting for the Stop write".to_owned())),
+      };
+      result.map(|()| message::OkV0::default().into()).map_err(Into::into)
     }
     .boxed()
   }

@@ -191,6 +191,16 @@ impl ProtocolInitializer for GenericProtocolInitializer {
 }
 
 pub trait ProtocolHandler: Sync + Send {
+  /// A positional feature has no universal neutral coordinate. Protocols with
+  /// an explicit motor-stop command can supply it here; never synthesize a move.
+  fn handle_position_stop_cmd(
+    &self,
+    _feature_index: u32,
+    _feature_id: Uuid,
+  ) -> Result<Vec<HardwareCommand>, ButtplugDeviceError> {
+    Ok(Vec::new())
+  }
+
   fn keepalive_strategy(&self) -> ProtocolKeepaliveStrategy {
     ProtocolKeepaliveStrategy::HardwareRequiredRepeatLastPacketStrategy
   }

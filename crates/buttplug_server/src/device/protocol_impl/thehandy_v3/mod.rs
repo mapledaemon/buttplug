@@ -154,6 +154,29 @@ pub struct TheHandyV3 {
 }
 
 impl ProtocolHandler for TheHandyV3 {
+  fn handle_position_stop_cmd(
+    &self,
+    _feature_index: u32,
+    feature_id: Uuid,
+  ) -> Result<Vec<HardwareCommand>, ButtplugDeviceError> {
+    let payload = handy_rpc::RpcMessage {
+      r#type: handy_rpc::MessageType::Request as i32,
+      message: Some(handy_rpc::rpc_message::Message::Request(
+        handy_rpc::Request {
+          id: self.seq.fetch_add(1, Ordering::Relaxed),
+          params: Some(handy_rpc::request::Params::RequestHdspStop(
+            handy_rpc::RequestHdspStop {},
+          )),
+        },
+      )),
+    };
+    // The same feature ID lets the urgent device-task path supersede pending
+    // position writes before writing Stop. HDSP Stop does not command a target.
+    Ok(vec![
+      HardwareWriteCmd::new(&[feature_id], Endpoint::Tx, payload.encode_to_vec(), true).into(),
+    ])
+  }
+
   fn keepalive_strategy(&self) -> ProtocolKeepaliveStrategy {
     let ping_payload = handy_rpc::Request {
       id: self.seq.fetch_add(1, Ordering::Relaxed),
@@ -235,6 +258,9 @@ impl ProtocolHandler for TheHandyV3 {
     ])
   }
 }
+
+#[cfg(test)]
+mod stop_tests;
 
 #[cfg(test)]
 mod tests {
